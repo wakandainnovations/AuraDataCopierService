@@ -12,9 +12,11 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -26,6 +28,10 @@ public class App {
     // multiple entities (e.g. a newly added entity that shares an existing keyword), so a
     // post matching that keyword must be linked to every one of them via mention_entities.
     private static final Map<String, List<Long>> KEYWORD_TO_IDS_MAP = new HashMap<>();
+    // Entity ids by lower-cased managed_entities.name. YouTube comments are saved with the ENTITY
+    // NAME in their keyword column (e.g. "O.M: Operation Mole"), not one of the entity's keywords
+    // (YouTubeMain runs one combined search per entity), so they are matched on name as well.
+    private static final Map<String, List<Long>> NAME_TO_IDS_MAP = new HashMap<>();
 
     // How often the copy runs (data.copier.interval.minutes in application.properties, default 60).
     // Pass "--once" to run a single copy and exit, as before.
@@ -68,13 +74,15 @@ public class App {
 
             // Reload every run: entities and keywords are added (e.g. "Add to platform") while running.
             KEYWORD_TO_IDS_MAP.clear();
+            NAME_TO_IDS_MAP.clear();
             loadEntityKeywords(connection);
-            System.out.println("Loaded " + KEYWORD_TO_IDS_MAP.size() + " entity keywords.");
+            loadEntityNames(connection);
+            System.out.println("Loaded " + KEYWORD_TO_IDS_MAP.size() + " entity keywords and " + NAME_TO_IDS_MAP.size() + " entity names.");
 
-            transferData(connection, "instagram_posts", "Instagram", "id", "text", "timestamp", "author", "sentiment_score", "keyword", "permalink", "sentiment_category");
-            transferData(connection, "x_posts", "X", "id", "text", "created_at", "author", "sentiment_score", "keyword", "permalink", "sentiment_category");
-            transferData(connection, "youtube_comments", "YouTube", "id", "text", "published_at", "author", "sentiment_score", "keyword", "permalink", "sentiment_category");
-            transferData(connection, "reddit_posts", "Reddit", "id", "text", "created_at", "author", "sentiment_score", "keyword", "permalink", "sentiment_category");
+            transferData(connection, "instagram_posts", "Instagram", "id", "text", "timestamp", "author", "sentiment_score", "keyword", "permalink", "sentiment_category", false);
+            transferData(connection, "x_posts", "X", "id", "text", "created_at", "author", "sentiment_score", "keyword", "permalink", "sentiment_category", false);
+            transferData(connection, "youtube_comments", "YouTube", "id", "text", "published_at", "author", "sentiment_score", "keyword", "permalink", "sentiment_category", true);
+            transferData(connection, "reddit_posts", "Reddit", "id", "text", "created_at", "author", "sentiment_score", "keyword", "permalink", "sentiment_category", false);
 
             System.out.println("[" + Instant.now() + "] Data consolidation complete.");
 
@@ -104,6 +112,19 @@ public class App {
         }
     }
 
+    private static void loadEntityNames(Connection connection) throws SQLException {
+        String sql = "SELECT id, name FROM managed_entities";
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) {
+                String name = rs.getString("name");
+                if (name != null && !name.trim().isEmpty()) {
+                    NAME_TO_IDS_MAP.computeIfAbsent(name.trim().toLowerCase(), k -> new ArrayList<>()).add(rs.getLong("id"));
+                }
+            }
+        }
+    }
+
     private static List<Long> getEntityIds(String keyword) {
         if (keyword == null || keyword.trim().isEmpty()) {
             return Collections.emptyList(); // No keyword — nothing to link
@@ -111,9 +132,33 @@ public class App {
         return KEYWORD_TO_IDS_MAP.getOrDefault(keyword.toLowerCase(), Collections.emptyList());
     }
 
+    // YouTube's keyword column holds the entity name for current rows, and a comma-joined keyword
+    // list (e.g. "GDN,GDNaidu") for some older ones. Match the whole value and each comma-separated
+    // part against both entity keywords and entity names, linking every entity found.
+    private static List<Long> getEntityIdsIncludingNames(String keyword) {
+        if (keyword == null || keyword.trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+        Set<Long> ids = new LinkedHashSet<>();
+        List<String> candidates = new ArrayList<>();
+        candidates.add(keyword.trim());
+        if (keyword.indexOf(',') >= 0) {
+            for (String part : keyword.split(",")) {
+                if (!part.trim().isEmpty()) candidates.add(part.trim());
+            }
+        }
+        for (String candidate : candidates) {
+            String key = candidate.toLowerCase();
+            ids.addAll(KEYWORD_TO_IDS_MAP.getOrDefault(key, Collections.emptyList()));
+            ids.addAll(NAME_TO_IDS_MAP.getOrDefault(key, Collections.emptyList()));
+        }
+        return new ArrayList<>(ids);
+    }
+
     private static void transferData(Connection connection, String sourceTable, String platform,
                                      String idColumn, String textColumn, String dateColumn,
-                                     String authorColumn, String sentimentScoreColumn, String keywordColumn, String permalinkColumn, String sentimentCategoryColumn) throws SQLException {
+                                     String authorColumn, String sentimentScoreColumn, String keywordColumn, String permalinkColumn, String sentimentCategoryColumn,
+                                     boolean matchEntityNames) throws SQLException {
         String selectSql = "SELECT " + idColumn + ", " + textColumn + ", " + dateColumn + ", " +
                            (authorColumn != null ? authorColumn + ", " : "") + sentimentScoreColumn + ", " + keywordColumn + ", " + permalinkColumn + ", " + sentimentCategoryColumn +
                            " FROM " + sourceTable;
@@ -152,7 +197,7 @@ public class App {
             while (rs.next()) {
                 String keyword = rs.getString(keywordColumn);
 
-                List<Long> entityIds = getEntityIds(keyword);
+                List<Long> entityIds = matchEntityNames ? getEntityIdsIncludingNames(keyword) : getEntityIds(keyword);
 
                 if (entityIds.isEmpty()) { // Skip if keyword matched no entity
                     continue;
